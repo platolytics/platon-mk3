@@ -1,0 +1,33 @@
+---
+cubes:
+- name: memorycube
+  description: Cube with memory data
+  ttl: "1h"
+  scrape-interval: "1m"
+  queries:
+  - name: memory_cached
+    promql: node_memory_Cached_bytes
+    value: cachedbytes
+  - name: free_bytes
+    promql: node_memory_MemFree_bytes
+    value: freebytes
+  joined-labels:
+  - job
+  - instance
+- name: smartmoncube
+  description: Cube with smartmon data
+  ttl: "1h"
+  scrape-interval: "1m"
+  queries:
+  - name: temperature
+    promql: sum by (job, instance) (smartmon_temperature_celsius_value)
+    value: temperature
+  - name: spin_up_time
+    promql: sum by (job, instance) (smartmon_spin_up_time_value)
+    value: spinuptime
+  - name: cpu_seconds
+    promql: node_cpu_seconds_total
+    value: cpuseconds
+  joined-labels:
+  - job
+  - instance

@@ -19,3 +19,8 @@
 
 # Go workspace file
 go.work
+
+# Project specific files
+superset_config.py
+.vscode
+platon
