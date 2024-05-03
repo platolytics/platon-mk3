@@ -1,0 +1,13 @@
+cubes:
+- name: apiservermemory
+  description: My Cube
+  ttl: 1h0m0s
+  scrape-interval: 1m0s
+  queries:
+  - name: apiserver_request_total
+    promql: sum by(instance) (apiserver_request_total)
+    value: apiserver_request_total
+  - name: node_memory_MemFree_bytes
+    promql: sum by(instance) (node_memory_MemFree_bytes)
+    value: node_memory_MemFree_bytes
+  joined-labels:
