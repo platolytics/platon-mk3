@@ -29,7 +29,8 @@ to quickly create a Cobra application.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		name, _ := cmd.Flags().GetString(nameArg)
 		metrics, _ := cmd.Flags().GetStringArray(dimensionsArg)
-		cube := platon.GenerateCube(name, metrics)
+		prometheusUrl, _ := cmd.Flags().GetString(PrometheusArg)
+		cube := platon.GenerateCube(name, metrics, prometheusUrl)
 		yamlBytes, err := yaml.Marshal(cube)
 		if err != nil {
 			panic(err)

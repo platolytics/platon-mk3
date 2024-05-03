@@ -1,6 +1,7 @@
 package platon
 
 import (
+	"fmt"
 	"os"
 	"slices"
 	"time"
@@ -42,6 +43,20 @@ func (t Table) GetColumns() []Column {
 	return cols
 }
 
+func (t Table) GetQuotedColumnNames() []string {
+
+	cols := []string{}
+
+	cols = append(cols, "\"Time\"")
+	for _, dimension := range t.Dimensions {
+		cols = append(cols, fmt.Sprintf("\"%s\"", dimension))
+	}
+	for _, metric := range t.Metrics {
+		cols = append(cols, fmt.Sprintf("\"%s\"", metric))
+	}
+	return cols
+}
+
 func (r Row) GetOrderedValues(order []Column) []interface{} {
 	values := []interface{}{}
 	for _, col := range order {
@@ -58,7 +73,7 @@ func (r Row) GetOrderedValues(order []Column) []interface{} {
 	return values
 }
 
-func (t *Table) addQueryResult(query Query, queryResult model.Value, cube Cube) {
+func (t *Table) addQueryResult(query Query, queryResult model.Value) {
 	matrix := queryResult.(model.Matrix)
 	for _, sampleStream := range matrix {
 		for _, value := range sampleStream.Values {
@@ -103,7 +118,7 @@ findMatchingRow:
 	t.Rows = append(t.Rows, rowInput)
 }
 
-func (t *Table) PrettyPrint() {
+func (t *Table) PrettyPrint(limit int) {
 	tab := table.NewWriter()
 	tab.SetOutputMirror(os.Stdout)
 	columns := t.GetColumns()
@@ -118,7 +133,10 @@ func (t *Table) PrettyPrint() {
 	tab.AppendHeader(columnTypes)
 	tab.AppendHeader(header)
 	tab.AppendHeader(types)
-	for _, row := range t.Rows {
+	for i, row := range t.Rows {
+		if i >= limit {
+			break
+		}
 		tab.AppendRows([]table.Row{
 			row.GetOrderedValues(columns),
 		})

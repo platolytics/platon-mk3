@@ -13,7 +13,7 @@ type Cube struct {
 	ScrapeInterval time.Duration `yaml:"scrape-interval"`
 	Queries        []Query       `yaml:"queries"`
 	JoinedLabels   []string      `yaml:"joined-labels"`
-	//lastUpdate     time.Time
+	LastUpdate     time.Time
 	//labels         []string
 }
 

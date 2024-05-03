@@ -2,9 +2,10 @@ package platon
 
 import (
 	"context"
-	"flag"
+	"crypto/tls"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"slices"
 	"strconv"
@@ -20,11 +21,13 @@ import (
 )
 
 type Platon struct {
-	Cubes     Cubes
-	Database  clickhouse.Clickhouse
-	StartTime time.Time
-	EndTime   time.Time
-	Client    api.Client
+	Cubes         Cubes
+	Database      clickhouse.Clickhouse
+	StartTime     time.Time
+	EndTime       time.Time
+	Client        api.Client
+	PrometheusUrl string
+	ctx           context.Context
 }
 
 type Metric struct {
@@ -32,8 +35,8 @@ type Metric struct {
 	Dimensions []string
 }
 
-func WatchCubes(clickhouse clickhouse.Clickhouse, cubes Cubes) {
-	p := NewPlaton()
+func WatchCubes(clickhouse clickhouse.Clickhouse, cubes Cubes, prometheusUrl string) {
+	p := NewPlaton(prometheusUrl)
 	p.Cubes = cubes
 	p.Database = clickhouse
 
@@ -41,20 +44,29 @@ func WatchCubes(clickhouse clickhouse.Clickhouse, cubes Cubes) {
 }
 
 func (p *Platon) WatchCubes() {
-	//for {
-	for _, cube := range p.Cubes.Cubes {
-		fmt.Printf("Updating cube %s.\n", cube.Name)
-		p.UpdateCube(cube)
+	for {
+		for _, cube := range p.Cubes.Cubes {
+			if cube.LastUpdate.Add(cube.ScrapeInterval).After(time.Now()) {
+				continue
+			}
+
+			fmt.Printf("Updating cube %s.\n", cube.Name)
+			p.UpdateCube(cube)
+			cube.LastUpdate = time.Now()
+		}
+		time.Sleep(1 * time.Minute)
 	}
-	//}
 }
 
-func NewPlaton() *Platon {
-	p := Platon{}
+func NewPlaton(prometheusUrl string) *Platon {
+	p := Platon{
+		PrometheusUrl: prometheusUrl,
+		ctx:           context.Background(),
+	}
 
 	p.SetQueryTimes()
 	// start prometheus client
-	client, err := GetPromClient()
+	client, err := p.getPromClient()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -63,29 +75,38 @@ func NewPlaton() *Platon {
 }
 
 func (p *Platon) UpdateCube(cube Cube) {
-	var queryResults []model.Value
 
 	tables := []Table{}
 
+	start := time.Now().Add(-1 * time.Hour)
+	if !cube.LastUpdate.IsZero() {
+		start = cube.LastUpdate.Add(1 * time.Minute)
+	}
+	end := time.Now()
 	for _, query := range cube.Queries {
 		fmt.Printf("Querying prometheus: %s\n", query.PromQL)
-		queryResult, err := p.GetSamples(string(query.PromQL))
+
+		queryResult, err := p.GetSamples(string(query.PromQL), start, end)
 		if err != nil {
 			panic(err)
 		}
-		queryResults = append(queryResults, queryResult)
 
-		table, err := MetricsToTable(query.Name, queryResults, cube)
+		table, err := MetricsToTable(query, queryResult)
 		if err != nil {
 			panic(err)
 		}
 
 		tables = append(tables, table)
-		table.PrettyPrint()
+		table.PrettyPrint(10)
 
-		err = p.CreateAndPopulateTable(table)
+		err = p.EnsureTable(table)
 		if err != nil {
 			panic(err)
+		}
+
+		err = p.InsertData(table)
+		if err != nil {
+			panic(fmt.Errorf("failed to add data to table %s: %v", table.Name, err))
 		}
 	}
 	err := p.CreateView(cube, tables)
@@ -102,7 +123,7 @@ func (p *Platon) CreateView(cube Cube, tables []Table) error {
 		for _, c := range t.GetColumns() {
 			if !slices.Contains(uniqueColumns, c.Name) {
 				uniqueColumns = append(uniqueColumns, c.Name)
-				columnsWithAlias = append(columnsWithAlias, fmt.Sprintf("T%d.%s %s", i, c.Name, c.Name))
+				columnsWithAlias = append(columnsWithAlias, fmt.Sprintf("\"T%d\".\"%s\" \"%s\"", i, c.Name, c.Name))
 			}
 		}
 	}
@@ -122,7 +143,7 @@ func (p *Platon) CreateView(cube Cube, tables []Table) error {
 		for _, joinCol := range joinCols {
 			onExpr = append(onExpr, fmt.Sprintf("T%d.%s=T%d.%s", i-1, joinCol, i, joinCol))
 		}
-		viewSqlBuilder = viewSqlBuilder.JoinWithOption(sb.FullOuterJoin, table.Name+" T"+strconv.Itoa(i), onExpr...)
+		viewSqlBuilder = viewSqlBuilder.JoinWithOption(sb.InnerJoin, table.Name+" T"+strconv.Itoa(i), onExpr...)
 	}
 	selectSql, _ := viewSqlBuilder.Build()
 	viewSql := "CREATE OR REPLACE VIEW " + cube.Name + " AS " + selectSql
@@ -137,43 +158,122 @@ func (p *Platon) CreateView(cube Cube, tables []Table) error {
 	return nil
 }
 
-func (p *Platon) CreateAndPopulateTable(table Table) error {
-	ctx := context.Background()
-	dropSql := "DROP TABLE IF EXISTS " + table.Name
-	fmt.Println("Executing SQL: " + dropSql)
-	err := p.Database.Connection.Exec(ctx, dropSql)
+func (p *Platon) EnsureTable(table Table) error {
+	exists, err := p.TableExists(table)
 	if err != nil {
-		return fmt.Errorf("failed to drop cube table: %w", err)
+		return fmt.Errorf("failed to figure out if table %s exists: %v", table.Name, err)
+	}
+	if exists {
+		err = p.EnsureColumns(table)
+		if err != nil {
+			return fmt.Errorf("failed to update table %s: %v", table.Name, err)
+		}
+		return nil
+	}
+	err = p.CreateTable(table)
+	if err != nil {
+		return fmt.Errorf("failed to create table %s: %v", table.Name, err)
+	}
+	return nil
+}
+
+func (p *Platon) TableExists(table Table) (bool, error) {
+	sql := fmt.Sprintf("EXISTS TABLE %s", table.Name)
+	row := p.Database.Connection.QueryRow(p.ctx, sql)
+	var existsCol uint8
+	if err := row.Scan(&existsCol); err != nil {
+		return false, fmt.Errorf("failed to query result row of sql '%s': %w", sql, err)
 	}
 
+	return existsCol == 1, nil
+}
+
+func (p *Platon) EnsureColumns(table Table) error {
+
+	sql := fmt.Sprintf("DESCRIBE TABLE %s", table.Name)
+	fmt.Printf("Executing sql: %s", sql)
+	rows, err := p.Database.Connection.Query(p.ctx, sql)
+	if err != nil {
+		return fmt.Errorf("failed to query table columns with sql '%s': %w", sql, err)
+	}
+	columnNames := []string{}
+	for rows.Next() {
+		var (
+			columnName        string
+			columnType        string
+			defaultType       string
+			defaultExpression string
+			comment           string
+			codec             string
+			ttl               string
+		)
+		err = rows.Scan(&columnName, &columnType, &defaultType, &defaultExpression, &comment, &codec, &ttl)
+		if err != nil {
+			return fmt.Errorf("failed to scan table columns from sql '%s': %w", sql, err)
+		}
+		fmt.Println("---")
+		fmt.Printf("Name: %s\n", columnName)
+		fmt.Printf("Type: %s\n", columnType)
+		fmt.Printf("defaultype: %s\n", defaultType)
+		fmt.Printf("defaultexpression: %s\n", defaultExpression)
+		fmt.Printf("Comment: %s\n", comment)
+		fmt.Printf("Codec: %s\n", codec)
+		fmt.Printf("ttl: %s\n", ttl)
+		columnNames = append(columnNames, columnName)
+	}
+
+	fmt.Printf("%d columns found in table %s: %v\n", len(columnNames), table.Name, columnNames)
+
+	for _, expectedCol := range table.GetColumns() {
+		if slices.Contains(columnNames, expectedCol.Name) {
+			continue
+		}
+		sql := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table.Name, expectedCol.Name, expectedCol.DataType)
+		fmt.Printf("Executing sql: %s", sql)
+		err := p.Database.Connection.Exec(p.ctx, sql)
+		if err != nil {
+			return fmt.Errorf("failed to update cube table %s with SQL '%s': %w", table.Name, sql, err)
+		}
+
+	}
+
+	return nil
+}
+
+func (p *Platon) CreateTable(table Table) error {
 	cols := table.GetColumns()
 	columns := ""
 	for _, c := range cols {
 		columns = columns + c.Name + " " + c.DataType + ","
 	}
 	columns = columns[:len(columns)-1]
-	sql := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s) PRIMARY KEY(Time)", table.Name, columns)
+	sql := fmt.Sprintf("CREATE TABLE %s (%s) PRIMARY KEY(Time)", table.Name, columns)
 	fmt.Println(sql)
 
-	err = p.Database.Connection.Exec(ctx, sql)
+	err := p.Database.Connection.Exec(p.ctx, sql)
 	if err != nil {
 		return fmt.Errorf("failed to create cube table: %w", err)
 	}
-
-	batch, err := p.Database.Connection.PrepareBatch(ctx, "INSERT INTO "+table.Name)
-	if err != nil {
-		return err
-	}
-	for i := 0; i < len(table.Rows); i++ {
-		//fmt.Printf("Adding %v", table.Rows[i].GetOrderedValues(cols)...)
-		err = batch.Append(table.Rows[i].GetOrderedValues(cols)...)
+	return nil
+}
+func (p *Platon) InsertData(table Table) error {
+	cols := table.GetColumns()
+	for i := 0; i < len(table.Rows)/100; i++ {
+		batch, err := p.Database.Connection.PrepareBatch(p.ctx, "INSERT INTO "+table.Name+" ("+strings.Join(table.GetQuotedColumnNames(), ", ")+")")
 		if err != nil {
-			return fmt.Errorf("failed to add row to batch: %w", err)
+			return err
 		}
-	}
-	err = batch.Send()
-	if err != nil {
-		return fmt.Errorf("failed to execute batch batch: %w", err)
+		for j := i * 100; j < len(table.Rows) && j < (i+1)*100; j++ {
+			//fmt.Printf("Adding %v", table.Rows[i].GetOrderedValues(cols)...)
+			err = batch.Append(table.Rows[j].GetOrderedValues(cols)...)
+			if err != nil {
+				return fmt.Errorf("failed to add row to batch: %w", err)
+			}
+		}
+		err = batch.Send()
+		if err != nil {
+			return fmt.Errorf("failed to execute batch batch: %w", err)
+		}
 	}
 	return nil
 }
@@ -181,18 +281,20 @@ func (p *Platon) CreateAndPopulateTable(table Table) error {
 var promClient api.Client
 var promClientInitialized bool = false
 
-func GetPromClient() (api.Client, error) {
+func (p *Platon) getPromClient() (api.Client, error) {
 	if promClientInitialized {
 		return promClient, nil
 	}
-	address := flag.String("address", "localhost", "Prometheus address")
-	port := flag.String("port", "9090", "Prometheus port")
-	isSSL := flag.Bool("ssl", false, "Enable transport security")
 
-	url := ConstructURL(*address, *port, *isSSL)
 	var err error
+	httpClient := http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
 	promClient, err = api.NewClient(api.Config{
-		Address: url,
+		Address: p.PrometheusUrl,
+		Client:  &httpClient,
 	})
 
 	if err != nil {
@@ -220,7 +322,7 @@ func (p *Platon) GetMetrics(metricsFilter ...string) ([]Metric, error) {
 			continue
 		}
 		//Query metric to identify dimensions
-		samples, err := p.GetSamples(metricName)
+		samples, err := p.GetSamples(metricName, time.Now().Add(-1*time.Hour), time.Now())
 		if err != nil {
 			return nil, fmt.Errorf("failed to query metric %s: %w", metricName, err)
 		}
@@ -244,9 +346,9 @@ func (p *Platon) GetMetrics(metricsFilter ...string) ([]Metric, error) {
 	return metrics, nil
 }
 
-func GenerateCube(cubeName string, metricNames []string) Cubes {
+func GenerateCube(cubeName string, metricNames []string, prometheusUrl string) Cubes {
 	cubes := Cubes{}
-	p := NewPlaton()
+	p := NewPlaton(prometheusUrl)
 	metrics, err := p.GetMetrics(metricNames...)
 	if err != nil {
 		panic(err)
@@ -270,11 +372,13 @@ func GenerateCube(cubeName string, metricNames []string) Cubes {
 			commonLabels = metric.Dimensions
 			continue
 		}
-		for _, label := range metric.Dimensions {
-			if !slices.Contains(commonLabels, label) {
-				commonLabels = slices.Delete(commonLabels, i, i)
+		newCommonLabels := []string{}
+		for _, label := range commonLabels {
+			if slices.Contains(metric.Dimensions, label) {
+				newCommonLabels = append(newCommonLabels, label)
 			}
 		}
+		commonLabels = newCommonLabels
 	}
 	cube.JoinedLabels = commonLabels
 	cubes.Cubes = []Cube{cube}
@@ -282,8 +386,8 @@ func GenerateCube(cubeName string, metricNames []string) Cubes {
 	return cubes
 }
 
-func PrintDimensions() {
-	p := NewPlaton()
+func PrintDimensions(prometheusUrl string) {
+	p := NewPlaton(prometheusUrl)
 	metrics, err := p.GetMetrics()
 	if err != nil {
 		panic(err)
@@ -301,8 +405,8 @@ func PrintDimensions() {
 	fmt.Printf("%d dimensions found in Prometheus instance.\n", len(allDimensions))
 }
 
-func PrintMetrics(dimensionFilter []string) {
-	p := NewPlaton()
+func PrintMetrics(dimensionFilter []string, prometheusUrl string) {
+	p := NewPlaton(prometheusUrl)
 
 	metrics, err := p.GetMetrics()
 	if err != nil {
@@ -332,10 +436,10 @@ metricLoop:
 	fmt.Printf("listing %d metrics out of %d found in Prometheus instance.\n", foundMetrics, len(metrics))
 }
 
-func (p *Platon) GetSamples(metric string) (model.Value, error) {
+func (p *Platon) GetSamples(metric string, start, end time.Time) (model.Value, error) {
 	v1api := v1.NewAPI(p.Client)
 
-	result, warnings, err := v1api.QueryRange(context.TODO(), metric, v1.Range{Start: p.StartTime, End: p.EndTime, Step: 1 * time.Minute}, v1.WithTimeout(5*time.Second))
+	result, warnings, err := v1api.QueryRange(context.TODO(), metric, v1.Range{Start: start, End: end, Step: 1 * time.Minute}, v1.WithTimeout(5*time.Second))
 	// Always log the warnings even if errors cause crash
 	if len(warnings) > 0 {
 		fmt.Printf("Warnings: %v\n", warnings)
@@ -353,28 +457,14 @@ func (p *Platon) SetQueryTimes() {
 	p.EndTime = time.Now()
 }
 
-// ConstructURL builds a URL and returns it as string
-func ConstructURL(address string, port string, ssl bool) string {
-	var url string
-	if ssl {
-		url = "https://" + address + ":" + port
-	}
-	if !ssl {
-		url = "http://" + address + ":" + port
-	}
-	return url
-}
-
-func MetricsToTable(metricName string, queryResults []model.Value, cube Cube) (Table, error) {
+func MetricsToTable(query Query, queryResult model.Value) (Table, error) {
 	table := Table{
-		Name:       metricName,
+		Name:       query.Name,
 		Dimensions: []string{},
 		Rows:       []*Row{},
 	}
 
-	for i := range queryResults {
-		table.addQueryResult(cube.Queries[i], queryResults[i], cube)
-	}
+	table.addQueryResult(query, queryResult)
 	fmt.Printf("Rows added to internal table: %d\n", len(table.Rows))
 	return table, nil
 }

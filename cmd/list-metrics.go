@@ -16,7 +16,8 @@ var metricsCmd = &cobra.Command{
 	Long:  ``,
 	Run: func(cmd *cobra.Command, args []string) {
 		dimensionFilter, _ := cmd.Flags().GetStringArray(dimensionsArg)
-		platon.PrintMetrics(dimensionFilter)
+		prometheusUrl, _ := cmd.Flags().GetString(PrometheusArg)
+		platon.PrintMetrics(dimensionFilter, prometheusUrl)
 	},
 }
 

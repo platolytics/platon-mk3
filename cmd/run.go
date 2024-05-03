@@ -50,7 +50,8 @@ func RunRun(cmd *cobra.Command, args []string) {
 		panic(err)
 	}
 	defer clickhouse.Connection.Close()
-	platon.WatchCubes(clickhouse, cubes)
+	prometheusUrl, _ := cmd.Flags().GetString(PrometheusArg)
+	platon.WatchCubes(clickhouse, cubes, prometheusUrl)
 }
 
 func parseCubesFile(cubeFile string) (cubes platon.Cubes, err error) {
