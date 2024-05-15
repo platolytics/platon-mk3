@@ -5,9 +5,12 @@ cubes:
   scrape-interval: 1m0s
   queries:
   - name: apiserver_request_total
-    promql: sum by(instance) (apiserver_request_total)
+    promql: rate(apiserver_request_total[1m])
     value: apiserver_request_total
-  - name: node_memory_MemFree_bytes
-    promql: sum by(instance) (node_memory_MemFree_bytes)
-    value: node_memory_MemFree_bytes
+    aggregation: SUM
+  - name: memory_working_set
+    promql: sum(container_memory_working_set_bytes{container!="", pod=~"kube-apiserver.*", name!~"POD|"}) without (container, id, name)
+    value: memory_working_set
+    aggregation: SUM
+
   joined-labels:
