@@ -1,6 +1,6 @@
 # Platon Mk3
 
-Blog: [platon-mk3.org]
+Blog: [platon-mk3.org](https://platon-mk3.org)
 
 This project is currently WIP. The Mk3 stack consists of:
 
