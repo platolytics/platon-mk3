@@ -64,9 +64,15 @@ func (r Row) GetOrderedValues(order []Column) []interface{} {
 		case "Dimension":
 			values = append(values, r.Dimensions[col.Name])
 		case "Metric":
-			values = append(values, r.Metrics[col.Name])
+			val, ok := r.Metrics[col.Name]
+			if ok {
+				values = append(values, val)
+				continue
+			}
+			values = append(values, nil)
+
 		case "Time":
-			values = append(values, r.Time)
+			values = append(values, r.Time.UTC())
 		}
 
 	}
@@ -95,26 +101,6 @@ func (t *Table) addQueryResult(query Query, queryResult model.Value) {
 }
 
 func (t *Table) InsertRow(rowInput *Row) {
-findMatchingRow:
-	for i := range t.Rows {
-		row := t.Rows[i]
-		if row.Time != rowInput.Time {
-			continue findMatchingRow
-		}
-		for dimension, value := range row.Dimensions {
-			inputValue, ok := rowInput.Dimensions[dimension]
-			if !ok || inputValue != value {
-				continue findMatchingRow
-			}
-		}
-		for inputDimension, value := range rowInput.Dimensions {
-			row.Dimensions[inputDimension] = value
-		}
-		for metric, value := range rowInput.Metrics {
-			row.Metrics[metric] = value
-		}
-		return
-	}
 	t.Rows = append(t.Rows, rowInput)
 }
 
@@ -165,4 +151,53 @@ func (t *Table) GetMetric(metric string) string {
 		t.Metrics = append(t.Metrics, metric)
 	}
 	return metric
+}
+
+func (t *Table) CountMatches(dimensions []string, otherRow *Row) (count uint64, err error) {
+	for _, r := range t.Rows {
+		for _, d := range dimensions {
+			val, ok := r.Dimensions[d]
+			if !ok {
+				err = fmt.Errorf("dimension %s doesn't exist in table %s", d, t.Name)
+				return
+			}
+			otherVal, ok := otherRow.Dimensions[d]
+			if !ok {
+				err = fmt.Errorf("dimension %s doesn't exist in other row", d)
+				return
+			}
+			if val != otherVal {
+				continue
+			}
+			if r.Time != otherRow.Time {
+				continue
+			}
+		}
+		count++
+	}
+
+	return
+}
+
+func (t *Table) GetFirstMatchingRow(dimensions []string, otherRow *Row) (*Row, error) {
+	for i, r := range t.Rows {
+		for _, d := range dimensions {
+			val, ok := r.Dimensions[d]
+			if !ok {
+				return nil, fmt.Errorf("dimension %s doesn't exist in table %s", d, t.Name)
+			}
+			otherVal, ok := otherRow.Dimensions[d]
+			if !ok {
+				return nil, fmt.Errorf("dimension %s doesn't exist in other row", d)
+			}
+			if val != otherVal {
+				continue
+			}
+			if r.Time != otherRow.Time {
+				continue
+			}
+		}
+		return t.Rows[i], nil
+	}
+	return nil, fmt.Errorf("no matching row found in table %s", t.Name)
 }

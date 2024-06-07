@@ -35,15 +35,81 @@ type Metric struct {
 	Dimensions []string
 }
 
+var DefaultRange time.Duration = 1 * time.Hour
+
+// Change DefaultRange for quick iteration during development
+//var DefaultRange time.Duration = 5 * time.Minute
+
 func WatchCubes(clickhouse clickhouse.Clickhouse, cubes Cubes, prometheusUrl string) {
 	p := NewPlaton(prometheusUrl)
 	p.Cubes = cubes
 	p.Database = clickhouse
 
-	p.WatchCubes()
+	p.watchCubes()
 }
 
-func (p *Platon) WatchCubes() {
+func DeleteCubes(clickhouse clickhouse.Clickhouse, cubes Cubes) error {
+	p := NewPlaton("")
+	p.Cubes = cubes
+	p.Database = clickhouse
+
+	for _, cube := range p.Cubes.Cubes {
+		sql := fmt.Sprintf("DROP TABLE IF EXISTS %s", cube.Name)
+		fmt.Println(sql)
+
+		err := p.Database.Connection.Exec(p.ctx, sql)
+		if err != nil {
+			return fmt.Errorf("failed to create cube table: %w", err)
+		}
+		for _, query := range cube.Queries {
+			sql := fmt.Sprintf("DROP TABLE IF EXISTS %s", query.Name)
+			fmt.Println(sql)
+
+			err := p.Database.Connection.Exec(p.ctx, sql)
+			if err != nil {
+				return fmt.Errorf("failed to drop metrics table: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+func ValueHelp(metric, dimension, prometheusUrl string) error {
+	p := NewPlaton(prometheusUrl)
+
+	values, err := p.queryValues(metric, dimension)
+	if err != nil {
+		return fmt.Errorf("failed to query metric %s: %w", metric, err)
+	}
+
+	fmt.Printf("%d values found for dimension %s in metric %s in the past hour:\n", len(values), dimension, metric)
+	for _, value := range values {
+		fmt.Println(value)
+	}
+
+	return nil
+}
+
+func (p *Platon) queryValues(metric, dimension string) ([]string, error) {
+	values := []string{}
+	samples, err := p.GetSamples(metric, time.Now().Add(-1*DefaultRange), time.Now())
+	if err != nil {
+		return values, fmt.Errorf("failed to query prometheus for metric %s: %w", metric, err)
+	}
+	matrix := samples.(model.Matrix)
+	for _, sampleStream := range matrix {
+		for label, value := range sampleStream.Metric {
+			if string(label) != dimension || slices.Contains(values, string(value)) {
+				continue
+			}
+			values = append(values, string(value))
+		}
+	}
+	return values, nil
+
+}
+
+func (p *Platon) watchCubes() {
 	for {
 		for _, cube := range p.Cubes.Cubes {
 			if cube.LastUpdate.Add(cube.ScrapeInterval).After(time.Now()) {
@@ -64,8 +130,6 @@ func NewPlaton(prometheusUrl string) *Platon {
 		ctx:           context.Background(),
 	}
 
-	p.SetQueryTimes()
-	// start prometheus client
 	client, err := p.getPromClient()
 	if err != nil {
 		log.Fatal(err)
@@ -78,7 +142,7 @@ func (p *Platon) UpdateCube(cube Cube) {
 
 	tables := []Table{}
 
-	start := time.Now().Add(-1 * time.Hour)
+	start := time.Now().Add(-1 * DefaultRange)
 	if !cube.LastUpdate.IsZero() {
 		start = cube.LastUpdate.Add(1 * time.Minute)
 	}
@@ -109,22 +173,175 @@ func (p *Platon) UpdateCube(cube Cube) {
 			panic(fmt.Errorf("failed to add data to table %s: %v", table.Name, err))
 		}
 	}
-	err := p.CreateView(cube, tables)
+	fullTable, err := p.generateFullTable(cube, tables)
 	if err != nil {
 		panic(err)
 	}
+
+	err = p.EnsureTable(fullTable)
+	if err != nil {
+		panic(err)
+	}
+
+	err = p.InsertData(fullTable)
+	if err != nil {
+		panic(fmt.Errorf("failed to add data to table %s: %v", fullTable.Name, err))
+	}
+
+	//err := p.createView(cube, tables)
+	//if err != nil {
+	//	panic(err)
+	//}
 }
 
-func (p *Platon) CreateView(cube Cube, tables []Table) error {
+func (p *Platon) generateFullTable(cube Cube, tables []Table) (Table, error) {
+	left := tables[0]
+	for i, t := range tables {
+		if i == 0 {
+			continue
+		}
 
-	uniqueColumns := []string{}
+		var err error
+		left, err = left.platonLeftJoin(cube, t)
+		if err != nil {
+			return Table{}, fmt.Errorf("failed to platon left join tables %s and %s: %w", left.Name, t.Name, err)
+		}
+	}
+
+	left.Name = cube.Name
+
+	return left, nil
+}
+
+func (left Table) platonLeftJoin(cube Cube, right Table) (Table, error) {
+	joinedTable := Table{
+		Dimensions: []string{},
+		Rows:       []*Row{},
+	}
+
+	// Set up dimensions & metrics
+	joinedTable.Dimensions = append(joinedTable.Dimensions, left.Dimensions...)
+	joinedTable.Metrics = append(joinedTable.Metrics, left.Metrics...)
+	for _, d := range right.Dimensions {
+		col := d
+		if !slices.Contains(cube.JoinedLabels, d) && d != "Time" {
+			col = fmt.Sprintf("%s_%s", right.Name, d)
+		}
+		if !slices.Contains(joinedTable.Dimensions, col) {
+			joinedTable.Dimensions = append(joinedTable.Dimensions, col)
+		}
+	}
+	joinedTable.Metrics = append(joinedTable.Metrics, right.Metrics...)
+
+	// Insert data from left table, just insert
+	for _, r := range left.Rows {
+		joinedTable.InsertRow(r)
+	}
+
+	// Right table - for each row:
+	// * Count matches (all joined dimensions match) in left table.
+	// ** If 0 matches, create a new row, setting all non-existent dimensions in the right table to NULL
+	// ** If one match, count matches in right table.
+	// *** If one match, insert values
+	// *** If more than one match, create a new row, setting all non-existent dimensions in the right table to '*'
+	// *** Update matching row in joined table row and set all dimensions of the right table to '*'
+	// ** If more than one match, create a new row, setting all non-existent dimensions in right table to '*'
+
+	for _, r := range right.Rows {
+		leftMatches, err := left.CountMatches(cube.JoinedLabels, r)
+		if err != nil {
+			return Table{}, fmt.Errorf("failed to count matches between tables %s and %s: %w", left.Name, right.Name, err)
+		}
+		switch leftMatches {
+		case 0:
+			newRow := Row{Time: r.Time, Metrics: r.Metrics}
+			for d, v := range r.Dimensions {
+				newDim := d
+				if !slices.Contains(cube.JoinedLabels, d) {
+					newDim = fmt.Sprintf("%s_%s", right.Name, d)
+				}
+				newRow.Dimensions[newDim] = v
+			}
+			joinedTable.InsertRow(&newRow)
+		case 1:
+			rightMatches, err := right.CountMatches(cube.JoinedLabels, r)
+			if err != nil {
+				return Table{}, fmt.Errorf("failed to count matches between tables %s and %s: %w", left.Name, right.Name, err)
+			}
+			matchingRow, err := joinedTable.GetFirstMatchingRow(cube.JoinedLabels, r)
+			if err != nil {
+				return Table{}, fmt.Errorf("failed to get matching row in joined table when joining %s and %s", left.Name, right.Name)
+			}
+			if rightMatches == 1 {
+				for d, v := range r.Dimensions {
+					newDim := d
+					if !slices.Contains(cube.JoinedLabels, d) {
+						newDim = fmt.Sprintf("%s_%s", right.Name, d)
+					}
+					matchingRow.Dimensions[newDim] = v
+				}
+				for m, v := range r.Metrics {
+					matchingRow.Metrics[m] = v
+				}
+				continue
+			}
+
+			newRow := Row{Time: r.Time, Metrics: r.Metrics}
+			for d, v := range r.Dimensions {
+				newDim := d
+				if !slices.Contains(cube.JoinedLabels, d) {
+					newDim = fmt.Sprintf("%s_%s", right.Name, d)
+				}
+				newRow.Dimensions[newDim] = v
+				matchingRow.Dimensions[newDim] = "*"
+			}
+			for _, d := range joinedTable.Dimensions {
+				_, ok := newRow.Dimensions[d]
+				if !ok {
+					newRow.Dimensions[d] = "*"
+				}
+			}
+			joinedTable.InsertRow(&newRow)
+
+		default:
+			newRow := Row{Time: r.Time, Metrics: r.Metrics, Dimensions: map[string]string{}}
+			for d, v := range r.Dimensions {
+				newDim := d
+				if !slices.Contains(cube.JoinedLabels, d) {
+					newDim = fmt.Sprintf("%s_%s", right.Name, d)
+				}
+				newRow.Dimensions[newDim] = v
+			}
+			for _, d := range joinedTable.Dimensions {
+				_, ok := newRow.Dimensions[d]
+				if !ok {
+					newRow.Dimensions[d] = "*"
+				}
+			}
+			joinedTable.InsertRow(&newRow)
+		}
+	}
+
+	return joinedTable, nil
+}
+
+func (p *Platon) createView(cube Cube, tables []Table) error {
+
 	columnsWithAlias := []string{}
 	for i, t := range tables {
 		for _, c := range t.GetColumns() {
-			if !slices.Contains(uniqueColumns, c.Name) {
-				uniqueColumns = append(uniqueColumns, c.Name)
-				columnsWithAlias = append(columnsWithAlias, fmt.Sprintf("\"T%d\".\"%s\" \"%s\"", i, c.Name, c.Name))
+			if slices.Contains(cube.GetMetricColumns(), c.Name) {
+				// metric column, aggregate values
+				columnsWithAlias = append(columnsWithAlias, fmt.Sprintf("%s(\"T%d\".\"%s\") \"%s\"", cube.GetAggregation(c.Name), i, c.Name, c.Name))
+				continue
 			}
+			if i == 0 && (slices.Contains(cube.JoinedLabels, c.Name) || c.Name == "Time") {
+				// join key, use original value
+				columnsWithAlias = append(columnsWithAlias, fmt.Sprintf("\"T%d\".\"%s\" \"%s\"", i, c.Name, c.Name))
+				continue
+			}
+			// additional column, make array and prefix column name
+			columnsWithAlias = append(columnsWithAlias, fmt.Sprintf("\"T%d\".\"%s\" \"%s.%s\"", i, c.Name, t.Name, c.Name))
 		}
 	}
 
@@ -132,6 +349,17 @@ func (p *Platon) CreateView(cube Cube, tables []Table) error {
 
 	viewSqlBuilder := sb.ClickHouse.NewSelectBuilder()
 	viewSqlBuilder = viewSqlBuilder.Select(columnsWithAlias...)
+	unionSqls := []string{}
+
+	joinCols := append(cube.JoinedLabels, "Time")
+	leftTableColumns := []string{}
+	for _, c := range tables[0].GetColumns() {
+		if slices.Contains(joinCols, c.Name) {
+			leftTableColumns = append(leftTableColumns, c.Name)
+			continue
+		}
+		leftTableColumns = append(leftTableColumns, fmt.Sprintf("MAX(\"%s\") \"%s\"", c.Name, c.Name))
+	}
 
 	for i, table := range tables {
 		if i == 0 {
@@ -139,14 +367,36 @@ func (p *Platon) CreateView(cube Cube, tables []Table) error {
 			continue
 		}
 		onExpr := []string{}
-		joinCols := append(cube.JoinedLabels, "Time")
 		for _, joinCol := range joinCols {
-			onExpr = append(onExpr, fmt.Sprintf("T%d.%s=T%d.%s", i-1, joinCol, i, joinCol))
+			onExpr = append(onExpr, fmt.Sprintf("T0.%s=T%d.%s", joinCol, i, joinCol))
 		}
-		viewSqlBuilder = viewSqlBuilder.JoinWithOption(sb.InnerJoin, table.Name+" T"+strconv.Itoa(i), onExpr...)
+		rightTableColumns := []string{}
+		for _, c := range table.GetColumns() {
+			if slices.Contains(joinCols, c.Name) {
+				rightTableColumns = append(rightTableColumns, c.Name)
+				continue
+			}
+			rightTableColumns = append(rightTableColumns, fmt.Sprintf("MAX(\"%s\") \"%s\"", c.Name, c.Name))
+		}
+		rightTableJoinBuilder := sb.ClickHouse.NewSelectBuilder().Select(rightTableColumns...).From(table.Name + " T" + strconv.Itoa(i))
+		rightTableJoinBuilder = rightTableJoinBuilder.GroupBy(joinCols...).Having("COUNT(Time) = 1")
+		rightTableSelect, _ := rightTableJoinBuilder.Build()
+
+		leftTableJoinBuilder := sb.ClickHouse.NewSelectBuilder().Select(leftTableColumns...).From(table.Name)
+		leftTableJoinBuilder = leftTableJoinBuilder.GroupBy(joinCols...).Having("COUNT(Time) != 1")
+		leftTableSelect, _ := leftTableJoinBuilder.Build()
+
+		rightTableUnionBuilder := sb.ClickHouse.NewSelectBuilder().Select(rightTableColumns...).From(table.Name+" T"+strconv.Itoa(i)).JoinWithOption("INNER ANY", "("+leftTableSelect+") T0", onExpr...).GroupBy(joinCols...)
+		rightTableUnionSql, _ := rightTableUnionBuilder.Build()
+		unionSqls = append(unionSqls, rightTableUnionSql)
+
+		viewSqlBuilder = viewSqlBuilder.JoinWithOption("LEFT", "("+rightTableSelect+") T1", onExpr...).GroupBy(joinCols...)
 	}
 	selectSql, _ := viewSqlBuilder.Build()
 	viewSql := "CREATE OR REPLACE VIEW " + cube.Name + " AS " + selectSql
+	if len(unionSqls) > 0 {
+		viewSql += " UNION ALL " + strings.Join(unionSqls, " UNION ALL ")
+	}
 
 	fmt.Println("Executing SQL: " + viewSql)
 
@@ -322,7 +572,7 @@ func (p *Platon) GetMetrics(metricsFilter ...string) ([]Metric, error) {
 			continue
 		}
 		//Query metric to identify dimensions
-		samples, err := p.GetSamples(metricName, time.Now().Add(-1*time.Hour), time.Now())
+		samples, err := p.GetSamples(metricName, time.Now().Add(-1*DefaultRange), time.Now())
 		if err != nil {
 			return nil, fmt.Errorf("failed to query metric %s: %w", metricName, err)
 		}
@@ -357,7 +607,7 @@ func GenerateCube(cubeName string, metricNames []string, prometheusUrl string) C
 	cube := Cube{
 		Name:           cubeName,
 		Description:    "My Cube",
-		Ttl:            1 * time.Hour,
+		Ttl:            DefaultRange,
 		ScrapeInterval: 1 * time.Minute,
 	}
 	commonLabels := []string{}
@@ -386,9 +636,9 @@ func GenerateCube(cubeName string, metricNames []string, prometheusUrl string) C
 	return cubes
 }
 
-func PrintDimensions(prometheusUrl string) {
+func PrintDimensions(metricsFilter []string, prometheusUrl string) {
 	p := NewPlaton(prometheusUrl)
-	metrics, err := p.GetMetrics()
+	metrics, err := p.GetMetrics(metricsFilter...)
 	if err != nil {
 		panic(err)
 	}
@@ -449,12 +699,6 @@ func (p *Platon) GetSamples(metric string, start, end time.Time) (model.Value, e
 	}
 
 	return result, nil
-}
-
-// SetQueryTimes sets startTime to now and endTime one hour in the past
-func (p *Platon) SetQueryTimes() {
-	p.StartTime = time.Now().Add(-1 * time.Hour)
-	p.EndTime = time.Now()
 }
 
 func MetricsToTable(query Query, queryResult model.Value) (Table, error) {
