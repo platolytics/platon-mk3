@@ -64,7 +64,13 @@ func (r Row) GetOrderedValues(order []Column) []interface{} {
 		case "Dimension":
 			values = append(values, r.Dimensions[col.Name])
 		case "Metric":
-			values = append(values, r.Metrics[col.Name])
+			val, ok := r.Metrics[col.Name]
+			if ok {
+				values = append(values, val)
+				continue
+			}
+			values = append(values, nil)
+
 		case "Time":
 			values = append(values, r.Time.UTC())
 		}
